@@ -13,8 +13,9 @@ process SRATOOLS_FASTERQDUMP {
     path certificate
 
     output:
-    tuple val(meta), path('*.fastq.gz'), emit: reads
-    path "versions.yml"                , emit: versions
+    tuple val(meta), path('*.fastq.gz')         , emit: reads
+    tuple val(meta), path('unpaired/*.fastq.gz'), optional: true, emit: unpaired
+    path "versions.yml"                         , emit: versions
 
     when:
     task.ext.when == null || task.ext.when
@@ -24,6 +25,23 @@ process SRATOOLS_FASTERQDUMP {
     def args2 = task.ext.args2 ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
     def outfile = meta.single_end ? "${prefix}.fastq" : prefix
+    // `--split-3` writes spots whose mate did not survive the submitter's QC to an
+    // UNSUFFIXED file alongside <prefix>_1/_2. It must not be left in the paired
+    // namespace: workflows/sra assigns fastq_1/fastq_2 positionally from a SORTED
+    // glob, and '.' (0x2E) sorts before '_' (0x5F), so an orphan left here would take
+    // reads[0] — the samplesheet would pair it with _1 and silently DROP _2, i.e.
+    // succeed with mispaired reads rather than fail. Moving it into a subdirectory
+    // keeps it out of the `*.fastq.gz` glob while still publishing it.
+    //
+    // Keyed on the file EXISTING, so this is a no-op under `--split-files` (which
+    // writes no orphan file) and for single-end runs, whose only output IS
+    // <prefix>.fastq.gz.
+    def segregate_unpaired = meta.single_end ? '' : """
+    if [ -f "${prefix}.fastq.gz" ]; then
+        mkdir -p unpaired
+        mv "${prefix}.fastq.gz" "unpaired/${prefix}.fastq.gz"
+    fi
+    """
     def key_file = ''
     if (certificate.toString().endsWith('.jwt')) {
         key_file += " --perm ${certificate}"
@@ -45,6 +63,7 @@ process SRATOOLS_FASTERQDUMP {
         --no-name \\
         --processes $task.cpus \\
         *.fastq
+    ${segregate_unpaired}
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
