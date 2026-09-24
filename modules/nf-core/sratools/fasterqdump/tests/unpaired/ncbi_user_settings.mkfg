@@ -1,0 +1,2 @@
+## fake NCBI settings — the module only `export`s this path, never reads it.
+/LIBS/GUID = "00000000-0000-0000-0000-000000000000"

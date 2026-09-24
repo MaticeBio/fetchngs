@@ -1,0 +1,238 @@
+/*
+ * `--split-3` orphan segregation — the MaticeBio fork's reason to exist.
+ *
+ * `--split-3` writes spots whose mate did not survive the submitter's QC to an
+ * UNSUFFIXED `<prefix>.fastq` beside `_1`/`_2`. `workflows/sra` assigns
+ * `fastq_1`/`fastq_2` POSITIONALLY from the sorted `reads` list, and '.' (0x2E) sorts
+ * before '_' (0x5F), so an orphan left under that name takes `reads[0]`: the
+ * samplesheet pairs it with `_1` and silently DROPS `_2`. The module renames it
+ * `<prefix>_unpaired.fastq.gz`, which sorts AFTER both.
+ *
+ * Two properties, and the tests below are split along them because the fork has
+ * already shipped each one broken, separately:
+ *
+ *   PAIRING   `reads[0]` is `_1` and `reads[1]` is `_2`, whatever else was dumped.
+ *             Getting this wrong succeeds with mispaired reads instead of failing,
+ *             which is strictly worse than the `fq lint` error it replaced.
+ *   PUBLISHING the orphan reaches `<outdir>/fastq/`. The first version of this fix
+ *             moved the orphan into `unpaired/` and added a second publishDir entry
+ *             with `pattern: "unpaired/*.fastq.gz"`; that entry published NOTHING
+ *             against a `gs://` outdir under `scratch = true` + `stageOutMode =
+ *             'copy'`, and the orphans were destroyed with the work dir. Pairing was
+ *             correct the whole time, so only a test that looks at the published
+ *             directory catches it.
+ *
+ * See `unpaired.config` for how the real module script runs with no sratools
+ * container, and `unpaired/README.md` for the fixtures.
+ */
+nextflow_process {
+    name "Test Process SRATOOLS_FASTERQDUMP --split-3 unpaired segregation"
+    script "../main.nf"
+    config "./unpaired.config"
+    process "SRATOOLS_FASTERQDUMP"
+
+    test("Paired-end with orphans: _1/_2 keep their positions and the orphan is renamed and published") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+            }
+            process {
+                """
+                input[0] = Channel.of([
+                    [ id:'SRR6001133', single_end:false ],
+                    file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/pe_with_orphans", checkIfExists: true)
+                ])
+                input[1] = file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/ncbi_user_settings.mkfg", checkIfExists: true)
+                input[2] = []
+                """
+            }
+        }
+
+        then {
+            def reads = process.out.reads[0][1].collect { file(it).name }
+
+            assertAll(
+                { assert process.success },
+
+                // PAIRING. The orphan is in the `reads` glob — it is a flat
+                // `*.fastq.gz` in the task root, by design, so that the publishDir
+                // rule that already works covers it. What keeps it harmless is the
+                // ORDER: Nextflow sorts a glob output's files, and '1' (0x31) < '2'
+                // (0x32) < 'u' (0x75) after the shared `SRR6001133_` prefix. This
+                // assertion is the sort-order proof, run rather than reasoned.
+                { assert reads == [
+                    'SRR6001133_1.fastq.gz',
+                    'SRR6001133_2.fastq.gz',
+                    'SRR6001133_unpaired.fastq.gz'
+                ] },
+
+                // `workflows/sra` reads exactly these two indexes and no further one.
+                { assert file(process.out.reads[0][1][0]).name == 'SRR6001133_1.fastq.gz' },
+                { assert file(process.out.reads[0][1][1]).name == 'SRR6001133_2.fastq.gz' },
+
+                // Nothing is named `SRR6001133.fastq.gz` any more — that name is what
+                // sorts to `reads[0]` and drops `_2`.
+                { assert !reads.contains('SRR6001133.fastq.gz') },
+
+                // The dedicated channel still exists, now globbing the flat name.
+                { assert process.out.unpaired.size() == 1 },
+                { assert file(process.out.unpaired[0][1]).name == 'SRR6001133_unpaired.fastq.gz' },
+
+                // PUBLISHING — all three in `<outdir>/fastq/`, flat. This is the
+                // assertion the shipped-and-broken version would have failed.
+                { assert file("$outputDir/fastq/SRR6001133_1.fastq.gz").exists() },
+                { assert file("$outputDir/fastq/SRR6001133_2.fastq.gz").exists() },
+                { assert file("$outputDir/fastq/SRR6001133_unpaired.fastq.gz").exists() },
+
+                // ...and no nested directory is involved any more.
+                { assert !file("$outputDir/fastq/unpaired").exists() },
+
+                // The RIGHT file was renamed. Each fake read names its own file, so
+                // an off-by-one in the rename (`_1` moved instead of the orphan)
+                // shows up here and nowhere else.
+                { assert path("$outputDir/fastq/SRR6001133_unpaired.fastq.gz").linesGzip[0] == '@SRR6001133' },
+                { assert path("$outputDir/fastq/SRR6001133_1.fastq.gz").linesGzip[0] == '@SRR6001133_1' },
+                { assert path("$outputDir/fastq/SRR6001133_2.fastq.gz").linesGzip[0] == '@SRR6001133_2' }
+            )
+        }
+    }
+
+    test("Paired-end with a technical read: _unpaired still sorts last") {
+
+        // `--include-technical` is what keeps a 10x barcode read, so a scrnaseq fetch
+        // can dump `_1`, `_2`, `_3` AND an orphan. '3' (0x33) is still below 'u'
+        // (0x75), so the orphan stays last and `reads[0]`/`reads[1]` are untouched.
+        when {
+            params {
+                outdir = "$outputDir"
+            }
+            process {
+                """
+                input[0] = Channel.of([
+                    [ id:'SRR6001133', single_end:false ],
+                    file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/pe_with_orphans_technical", checkIfExists: true)
+                ])
+                input[1] = file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/ncbi_user_settings.mkfg", checkIfExists: true)
+                input[2] = []
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert process.success },
+                { assert process.out.reads[0][1].collect { file(it).name } == [
+                    'SRR6001133_1.fastq.gz',
+                    'SRR6001133_2.fastq.gz',
+                    'SRR6001133_3.fastq.gz',
+                    'SRR6001133_unpaired.fastq.gz'
+                ] },
+                { assert file(process.out.unpaired[0][1]).name == 'SRR6001133_unpaired.fastq.gz' }
+            )
+        }
+    }
+
+    test("Paired-end with no orphans: nothing is renamed and the channel stays empty") {
+
+        when {
+            params {
+                outdir = "$outputDir"
+            }
+            process {
+                """
+                input[0] = Channel.of([
+                    [ id:'SRR1234567', single_end:false ],
+                    file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/pe_clean", checkIfExists: true)
+                ])
+                input[1] = file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/ncbi_user_settings.mkfg", checkIfExists: true)
+                input[2] = []
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert process.success },
+                { assert process.out.reads[0][1].collect { file(it).name } == [
+                    'SRR1234567_1.fastq.gz',
+                    'SRR1234567_2.fastq.gz'
+                ] },
+                // `optional: true` means no emission at all, not an empty list.
+                { assert process.out.unpaired.size() == 0 },
+                { assert !file("$outputDir/fastq/SRR1234567_unpaired.fastq.gz").exists() }
+            )
+        }
+    }
+
+    test("Single-end: the one output keeps its name") {
+
+        // A single-end run's only output IS `<prefix>.fastq.gz`. Renaming it would
+        // label an entire library `_unpaired` and, before that, moving it into
+        // `unpaired/` emptied the non-optional `*.fastq.gz` glob and failed the task.
+        when {
+            params {
+                outdir = "$outputDir"
+            }
+            process {
+                """
+                input[0] = Channel.of([
+                    [ id:'SRR7654321', single_end:true ],
+                    file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/only_unsuffixed", checkIfExists: true)
+                ])
+                input[1] = file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/ncbi_user_settings.mkfg", checkIfExists: true)
+                input[2] = []
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert process.success },
+                // ONE matching file, so the `path()` output emits a single path rather
+                // than a list — which is the shape `workflows/sra` already handles
+                // (`fastq instanceof List ? fastq.flatten() : [ fastq ]`).
+                { assert !(process.out.reads[0][1] instanceof List) },
+                { assert file(process.out.reads[0][1]).name == 'SRR7654321.fastq.gz' },
+                { assert process.out.unpaired.size() == 0 },
+                { assert file("$outputDir/fastq/SRR7654321.fastq.gz").exists() }
+            )
+        }
+    }
+
+    test("Paired-labelled run whose every spot is single: the only file is reads, not an orphan") {
+
+        // ENA says PAIRED, `--split-3` finds no mate anywhere, and the dump is one
+        // unsuffixed file. That file is the library's reads, so it must keep its name
+        // — which is why the rename is guarded on `_1` existing too, and not on the
+        // unsuffixed file alone.
+        when {
+            params {
+                outdir = "$outputDir"
+            }
+            process {
+                """
+                input[0] = Channel.of([
+                    [ id:'SRR9999999', single_end:false ],
+                    file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/only_unsuffixed", checkIfExists: true)
+                ])
+                input[1] = file("\${projectDir}/modules/nf-core/sratools/fasterqdump/tests/unpaired/ncbi_user_settings.mkfg", checkIfExists: true)
+                input[2] = []
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert process.success },
+                // ONE matching file, so the `path()` output emits a single path rather
+                // than a list — which is the shape `workflows/sra` already handles
+                // (`fastq instanceof List ? fastq.flatten() : [ fastq ]`).
+                { assert !(process.out.reads[0][1] instanceof List) },
+                { assert file(process.out.reads[0][1]).name == 'SRR9999999.fastq.gz' },
+                { assert process.out.unpaired.size() == 0 },
+                { assert file("$outputDir/fastq/SRR9999999.fastq.gz").exists() }
+            )
+        }
+    }
+}

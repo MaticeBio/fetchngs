@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#
+# Fake `fasterq-dump` for `../../unpaired.nf.test`. Writes exactly the files the
+# staged SRA directory's `plan` names — one suffix per line, appended to `--outfile`,
+# with `-` meaning the unsuffixed file `--split-3` writes its mate-less spots to.
+#
+# It does NOT simulate fasterq-dump's spot logic, and is not meant to: the module's
+# `script:` block is what is under test, and what it needs from this tool is a set of
+# files with particular names. Each read header names its own file, so a test can tell
+# which file was renamed.
+set -eu
+
+outfile=""
+sra=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --outfile) outfile="$2"; shift 2 ;;
+        --threads|--perm|--ngc) shift 2 ;;
+        -*) shift ;;
+        *) sra="$1"; shift ;;
+    esac
+done
+
+# `--outfile` is `<prefix>` for a paired-end dump and `<prefix>.fastq` for a
+# single-end one; both mean the same base name to fasterq-dump.
+base="${outfile%.fastq}"
+
+while read -r suffix; do
+    if [ -z "$suffix" ]; then continue; fi
+    if [ "$suffix" = "-" ]; then suffix=""; fi
+    printf '@%s\nACGT\n+\nIIII\n' "${base}${suffix}" > "${base}${suffix}.fastq"
+done < "${sra}/plan"

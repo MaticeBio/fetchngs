@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#
+# Fake `pigz` for `../../unpaired.nf.test` — gzip, ignoring the flags the module
+# passes (`--no-name`, `--processes N`). Only the resulting `.fastq.gz` NAMES matter
+# to what is under test, but real gzip is used so the assertions can read a published
+# file back and check which one was renamed.
+set -eu
+for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    if [ -f "$a" ]; then gzip -n -f "$a"; fi
+done
